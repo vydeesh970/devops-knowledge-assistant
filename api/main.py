@@ -1,87 +1,50 @@
-"""
-main.py
-
-What this file does:
-Wraps our LangGraph agent in a FastAPI web API.
-
-WHY FASTAPI?
-Right now our agent only works when you run a Python script.
-FastAPI turns it into a proper web service that:
-- Accepts questions via HTTP requests (like a real API)
-- Returns answers as JSON
-- Can be called from any frontend, mobile app, or other service
-- Has automatic documentation at /docs
-
-WHY REDIS CACHING?
-Every time someone asks a question, we call Claude (costs money + takes time).
-If someone asks the same question twice, why call Claude again?
-Redis stores recent answers in memory:
-- Cache hit: returns answer in <10ms (free)
-- Cache miss: runs the full agent (~3-5 seconds, costs API credits)
-
-This is exactly how production AI APIs work.
-"""
-
 import sys
 import os
 import hashlib
 import json
 import time
+from dotenv import load_dotenv
 
-# Add parent directory to path so we can import our agent
+load_dotenv()
+
+os.environ["LANGCHAIN_TRACING_V2"] = os.getenv("LANGCHAIN_TRACING_V2", "true")
+os.environ["LANGCHAIN_ENDPOINT"] = os.getenv("LANGCHAIN_ENDPOINT", "https://api.smith.langchain.com")
+os.environ["LANGCHAIN_API_KEY"] = os.getenv("LANGCHAIN_API_KEY", "")
+os.environ["LANGCHAIN_PROJECT"] = os.getenv("LANGCHAIN_PROJECT", "devops-knowledge-assistant")
+
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import redis
-from dotenv import load_dotenv
 
 from agent.graph import build_agent
-
-load_dotenv()
-
-
-# ============================================================
-# FASTAPI APP SETUP
-# ============================================================
 
 app = FastAPI(
     title="DevOps Knowledge Assistant",
     description="""
     AI-powered assistant for DevOps teams.
-    
+
     Ask questions about:
     - Kubernetes concepts and troubleshooting
     - FastAPI development
     - Support ticket status and management
-    
-    Built with LangGraph, Claude, ChromaDB, PostgreSQL, and Redis.
+
+    Built with LangGraph, Claude, ChromaDB, and Redis.
     """,
     version="1.0.0"
 )
 
-# CORS = Cross Origin Resource Sharing
-# This allows a frontend (like a React app) to call our API
-# Without this, browsers block requests from different domains
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],    # In production, restrict this to your domain
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-# ============================================================
-# REDIS CACHE SETUP
-# ============================================================
-
 def get_redis_client():
-    """
-    Connects to our Redis instance running in Docker.
-    Returns None if Redis isn't available (graceful degradation)
-    so the API still works even without caching.
-    """
     try:
         client = redis.Redis(
             host="localhost",
@@ -90,25 +53,18 @@ def get_redis_client():
             decode_responses=True,
             socket_connect_timeout=2
         )
-        client.ping()  # Test the connection
+        client.ping()
         return client
     except Exception:
         print("⚠️  Redis not available - running without cache")
         return None
 
 
-# Initialize Redis and agent at startup
 redis_client = get_redis_client()
 agent = build_agent()
 
-CACHE_TTL = 3600  # Cache answers for 1 hour (in seconds)
+CACHE_TTL = 3600
 
-
-# ============================================================
-# REQUEST/RESPONSE MODELS
-# Pydantic models define exactly what our API accepts and returns
-# FastAPI uses these for automatic validation and documentation
-# ============================================================
 
 class QuestionRequest(BaseModel):
     question: str
@@ -125,8 +81,8 @@ class QuestionResponse(BaseModel):
     question: str
     answer: str
     query_type: str
-    cached: bool          # Was this answer from cache or freshly generated?
-    response_time_ms: int # How long did it take?
+    cached: bool
+    response_time_ms: int
 
 
 class HealthResponse(BaseModel):
@@ -135,21 +91,11 @@ class HealthResponse(BaseModel):
     agent: str
 
 
-# ============================================================
-# CACHE HELPER FUNCTIONS
-# ============================================================
-
 def get_cache_key(question: str) -> str:
-    """
-    Creates a unique cache key for each question.
-    We use MD5 hash of the question so the key is always
-    the same length regardless of question length.
-    """
     return f"devops_assistant:{hashlib.md5(question.lower().strip().encode()).hexdigest()}"
 
 
 def get_cached_answer(question: str):
-    """Try to get a cached answer from Redis"""
     if not redis_client:
         return None
     try:
@@ -163,27 +109,17 @@ def get_cached_answer(question: str):
 
 
 def cache_answer(question: str, answer_data: dict):
-    """Save an answer to Redis cache"""
     if not redis_client:
         return
     try:
         key = get_cache_key(question)
-        redis_client.setex(
-            key,
-            CACHE_TTL,
-            json.dumps(answer_data)
-        )
+        redis_client.setex(key, CACHE_TTL, json.dumps(answer_data))
     except Exception:
         pass
 
 
-# ============================================================
-# API ENDPOINTS
-# ============================================================
-
-@app.get("/", response_model=dict)
+@app.get("/")
 def root():
-    """Root endpoint - confirms the API is running"""
     return {
         "message": "DevOps Knowledge Assistant API",
         "docs": "/docs",
@@ -193,13 +129,7 @@ def root():
 
 @app.get("/health", response_model=HealthResponse)
 def health_check():
-    """
-    Health check endpoint.
-    Used by monitoring systems and load balancers to verify
-    the service is running correctly.
-    """
     redis_status = "connected" if redis_client else "unavailable"
-
     return HealthResponse(
         status="healthy",
         redis=redis_status,
@@ -209,29 +139,15 @@ def health_check():
 
 @app.post("/ask", response_model=QuestionResponse)
 def ask_question(request: QuestionRequest):
-    """
-    Main endpoint - accepts a question and returns an answer.
-
-    Flow:
-    1. Check Redis cache for existing answer
-    2. If cached: return immediately (fast + free)
-    3. If not cached: run the LangGraph agent
-    4. Save new answer to cache
-    5. Return answer with metadata
-    """
     if not request.question.strip():
-        raise HTTPException(
-            status_code=400,
-            detail="Question cannot be empty"
-        )
+        raise HTTPException(status_code=400, detail="Question cannot be empty")
 
     start_time = time.time()
 
-    # Step 1: Check cache
     cached = get_cached_answer(request.question)
     if cached:
         response_time = int((time.time() - start_time) * 1000)
-        print(f"⚡ Cache hit for: '{request.question[:50]}...'")
+        print(f"⚡ Cache hit for: '{request.question[:50]}'")
         return QuestionResponse(
             question=request.question,
             answer=cached["answer"],
@@ -240,8 +156,7 @@ def ask_question(request: QuestionRequest):
             response_time_ms=response_time
         )
 
-    # Step 2: Run the agent
-    print(f"🤖 Running agent for: '{request.question[:50]}...'")
+    print(f"🤖 Running agent for: '{request.question[:50]}'")
     try:
         result = agent.invoke({
             "question": request.question,
@@ -251,14 +166,10 @@ def ask_question(request: QuestionRequest):
             "answer": ""
         })
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Agent error: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Agent error: {str(e)}")
 
     response_time = int((time.time() - start_time) * 1000)
 
-    # Step 3: Cache the answer
     answer_data = {
         "answer": result["answer"],
         "query_type": result["query_type"]
@@ -276,12 +187,8 @@ def ask_question(request: QuestionRequest):
     )
 
 
-@app.get("/tickets/open", response_model=dict)
+@app.get("/tickets/open")
 def get_open_tickets():
-    """
-    Convenience endpoint to get all open tickets directly.
-    No AI needed for this - pure database query.
-    """
     import sqlite3
     conn = sqlite3.connect("data/tickets.db")
     cursor = conn.cursor()
@@ -297,16 +204,11 @@ def get_open_tickets():
     columns = ["ticket_id", "title", "category",
                "priority", "status", "assignee", "created_at"]
     tickets = [dict(zip(columns, row)) for row in rows]
-
-    return {
-        "total": len(tickets),
-        "tickets": tickets
-    }
+    return {"total": len(tickets), "tickets": tickets}
 
 
-@app.delete("/cache", response_model=dict)
+@app.delete("/cache")
 def clear_cache():
-    """Clears all cached answers - useful during development"""
     if not redis_client:
         return {"message": "Redis not available"}
     try:
