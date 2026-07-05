@@ -1,0 +1,29 @@
+# Virtual environment - Docker installs its own
+venv/
+
+# Environment variables - never put secrets in containers
+.env
+
+# Python cache files - not needed
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Git history - not needed in container
+.git/
+.gitignore
+
+# Processed data - will be generated at runtime
+data/processed/
+data/chroma_db/
+
+# VS Code settings
+.vscode/
+
+# Test files
+tests/
+
+# Logs
+*.log
